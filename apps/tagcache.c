@@ -413,6 +413,14 @@ static volatile int read_lock;
 
 static bool delete_entry(long idx_id);
 
+#if !defined(__PCTOOL__) && !defined(APPLICATION)
+/* Faster database updates: see update_lookup_build() and
+ * delete_entries_batch() */
+#define TAGCACHE_UPDATE_LOOKUP
+static bool delete_entries_batch(const int32_t *ids, long count,
+                                 void *work, size_t worksize);
+#endif
+
 static inline void str_setlen(char *buf, size_t len)
 {
     buf[len] = '\0';
@@ -2270,7 +2278,7 @@ static void db_log(const char *prefix, const char *msg)
 }
 #endif
 
-#if !defined(__PCTOOL__) && !defined(APPLICATION)
+#ifdef TAGCACHE_UPDATE_LOOKUP
 /* Update lookup table.
  *
  * During a database update every file found on disk has to be looked up in
@@ -2283,8 +2291,12 @@ static void db_log(const char *prefix, const char *msg)
  *   (hash of path) -> (index id, mtime)
  * so each lookup is a binary search in RAM. The table only uses memory that
  * is already free (never shrinking the audio buffer, which would interrupt
- * playback); if there isn't enough, the old disk lookups are used. */
-#define TAGCACHE_UPDATE_LOOKUP
+ * playback); if there isn't enough, the old disk lookups are used.
+ *
+ * The same allocation also holds the list of entries to delete because
+ * their file changed. Those deletions are done together at the end of the
+ * scan with delete_entries_batch(), reusing the table memory as work space,
+ * instead of one full pass over the master index per changed file. */
 
 struct update_lookup_entry {
     uint32_t hash1;
@@ -2296,6 +2308,9 @@ struct update_lookup_entry {
 static int update_lookup_handle = 0;
 static struct update_lookup_entry *update_lookup = NULL;
 static long update_lookup_count = 0;
+static long update_lookup_size = 0;     /* allocated table slots */
+static int32_t *update_lookup_pending = NULL; /* deferred deletions */
+static long update_lookup_pending_count = 0;
 
 /* Two different 32-bit string hashes (FNV-1a and djb2-xor), giving a 64-bit
  * key; a false match between two different paths is vanishingly unlikely. */
@@ -2322,13 +2337,46 @@ static int update_lookup_cmp(const void *p1, const void *p2)
     return 0;
 }
 
+/* Queue a deletion for the end of the scan. Returns false if it can't be
+ * deferred, in which case the caller deletes the entry right away. */
+static bool update_lookup_defer_delete(int32_t idx_id)
+{
+#ifdef HAVE_TC_RAMCACHE
+    /* With the database in RAM, delete_entry() is already fast and also
+     * has to keep the RAM copy in sync, so don't batch. */
+    if (tc_stat.ramcache)
+        return false;
+#endif
+    if (!update_lookup || update_lookup_pending_count >= update_lookup_size)
+        return false;
+
+    update_lookup_pending[update_lookup_pending_count++] = idx_id;
+    return true;
+}
+
+/* Do the deferred deletions, then free the table. Must run before commit(),
+ * which adds the re-read entries for the changed files. */
 static void update_lookup_free(void)
 {
+    if (update_lookup && update_lookup_pending_count > 0)
+    {
+        logf("update lookup: deleting %ld changed entries",
+             update_lookup_pending_count);
+        /* the table itself is no longer needed: use it as work space */
+        delete_entries_batch(update_lookup_pending,
+                             update_lookup_pending_count, update_lookup,
+                             update_lookup_size *
+                                sizeof(struct update_lookup_entry));
+    }
+
     if (update_lookup_handle > 0)
         core_free(update_lookup_handle);
     update_lookup_handle = 0;
     update_lookup = NULL;
     update_lookup_count = 0;
+    update_lookup_size = 0;
+    update_lookup_pending = NULL;
+    update_lookup_pending_count = 0;
 }
 
 static void update_lookup_build(void)
@@ -2351,7 +2399,8 @@ static void update_lookup_build(void)
         return;
 
     n = tcmh.tch.entry_count;
-    size_t size = n * sizeof(struct update_lookup_entry);
+    /* table + list of deferred deletions (at most one per entry) */
+    size_t size = n * (sizeof(struct update_lookup_entry) + sizeof(int32_t));
 
     /* Leave some headroom so nothing else gets squeezed either. */
     if (n <= 0 || core_allocatable() < size + 64*1024)
@@ -2370,6 +2419,9 @@ static void update_lookup_build(void)
         return;
     }
     update_lookup = core_get_data(update_lookup_handle);
+    update_lookup_size = n;
+    update_lookup_pending = (int32_t *)&update_lookup[n];
+    update_lookup_pending_count = 0;
 
     /* Pass 1: mtime of every index entry. idx_id is a state until pass 2:
      * -1 = deleted, -2 = waiting for its filename. Entries still negative
@@ -2558,6 +2610,13 @@ static void NO_INLINE add_tagcache(char *path, unsigned long mtime)
         /* Metadata might have been changed. Delete the entry. */
         logf("Re-adding: %s", path);
         DB_LOG("info", "re-adding");
+#ifdef TAGCACHE_UPDATE_LOOKUP
+        /* Deleted together with the other changed files at the end of
+         * the scan (before commit), see update_lookup_free() */
+        if (update_lookup_defer_delete(idx_id))
+            ;
+        else
+#endif
         if (!delete_entry(idx_id))
         {
             logf("delete_entry failed: %d", idx_id);
@@ -4522,6 +4581,263 @@ static bool delete_entry(long idx_id)
     return false;
 }
 
+#ifdef TAGCACHE_UPDATE_LOOKUP
+/* Batched version of delete_entry() for when many entries go at once (files
+ * changed or removed during an update).
+ *
+ * delete_entry() reads the whole master index for every entry it deletes,
+ * to find out which of the entry's strings (artist, album, ...) are still
+ * used by other entries. Here a group of entries is marked deleted first,
+ * then a single pass over the master index finds which of their strings are
+ * still in use, so the cost is one pass per group instead of one per entry.
+ *
+ * The end result is the same as calling delete_entry() for each id: the
+ * entries are flagged deleted, their string tag_seeks are replaced by the
+ * CRC of the string (so statistics can be resurrected by commit()), and
+ * strings no longer used by any live entry are blanked.
+ *
+ * Only for use when the database is not loaded in RAM. */
+struct del_item {
+    struct index_entry idx; /* the entry, rewritten at the end */
+    int32_t idx_id;
+    uint32_t in_use;        /* bit per tag: string used by a live entry */
+};
+
+struct del_seekref {
+    int32_t seek;           /* original tag_seek */
+    int32_t item;           /* index into the del_item array */
+};
+
+static int del_seekref_cmp(const void *p1, const void *p2)
+{
+    const struct del_seekref *r1 = p1, *r2 = p2;
+    if (r1->seek != r2->seek)
+        return r1->seek < r2->seek ? -1 : 1;
+    return r1->item - r2->item;
+}
+
+/* first ref with seek >= value, or count */
+static long del_seekref_lower(const struct del_seekref *refs, long count,
+                              int32_t value)
+{
+    long lo = 0, hi = count;
+    while (lo < hi)
+    {
+        long mid = lo + (hi - lo) / 2;
+        if (refs[mid].seek < value)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+static bool delete_batch_chunk(const int32_t *ids, long k,
+                               struct del_item *items,
+                               struct del_seekref *refs,
+                               const int *string_tags, int nstr)
+{
+    struct master_header hdr;
+    struct tagcache_header tch;
+    struct index_entry idx;
+    struct tagfile_entry tfe;
+    int fd = -1;
+    long i, j, m = 0;
+
+    int masterfd = open_master_fd(&hdr, true);
+    if (masterfd < 0)
+        return false;
+
+    /* 1. Read the entries and flag them deleted, so the scan below doesn't
+     *    count them as users of their own strings. */
+    for (j = 0; j < k; j++)
+    {
+        int32_t id = ids[j];
+        if (id < 0 || id >= hdr.tch.entry_count)
+            continue;
+
+        off_t pos = sizeof(struct master_header) +
+                    (off_t)id * sizeof(struct index_entry);
+        lseek(masterfd, pos, SEEK_SET);
+        if (read_index_entries(masterfd, &items[m].idx, 1)
+                != sizeof(struct index_entry))
+            goto fail;
+
+        if (items[m].idx.flag & FLAG_DELETED)
+            continue; /* already deleted, or listed twice */
+
+        items[m].idx.flag |= FLAG_DELETED;
+        lseek(masterfd, pos, SEEK_SET);
+        if (write_index_entries(masterfd, &items[m].idx, 1)
+                != sizeof(struct index_entry))
+            goto fail;
+
+        items[m].idx_id = id;
+        items[m].in_use = 0;
+        m++;
+    }
+
+    if (m == 0)
+    {
+        close(masterfd);
+        return true;
+    }
+
+    /* 2. For each string tag, the entries' seeks sorted for searching.
+     *    refs[s*m .. s*m+m-1] belong to string_tags[s]. */
+    for (int s = 0; s < nstr; s++)
+    {
+        struct del_seekref *r = &refs[s * m];
+        for (j = 0; j < m; j++)
+        {
+            r[j].seek = items[j].idx.tag_seek[string_tags[s]];
+            r[j].item = j;
+        }
+        qsort(r, m, sizeof(struct del_seekref), del_seekref_cmp);
+    }
+
+    /* 3. One pass over the master index: mark strings still in use. */
+    lseek(masterfd, sizeof(struct master_header), SEEK_SET);
+    for (i = 0; i < hdr.tch.entry_count; i++)
+    {
+        if (read_index_entries(masterfd, &idx, 1) != sizeof(struct index_entry))
+            goto fail;
+
+        if (idx.flag & FLAG_DELETED)
+            continue;
+
+        for (int s = 0; s < nstr; s++)
+        {
+            const struct del_seekref *r = &refs[s * m];
+            int32_t seek = idx.tag_seek[string_tags[s]];
+            for (j = del_seekref_lower(r, m, seek); j < m && r[j].seek == seek; j++)
+                items[r[j].item].in_use |= BIT_N(string_tags[s]);
+        }
+
+        do_timed_yield();
+    }
+
+    /* 4. Per tag: hash each string (for statistics resurrection), then blank
+     *    it if no live entry uses it. Entries sharing a string are handled
+     *    together, so the string is read before it is blanked. */
+    for (int s = 0; s < nstr; s++)
+    {
+        int tag = string_tags[s];
+        const struct del_seekref *r = &refs[s * m];
+
+        if ((fd = open_tag_fd(&tch, tag, true)) < 0)
+            goto fail;
+
+        for (j = 0; j < m; )
+        {
+            int32_t seek = r[j].seek;
+            long end = j;
+            while (end < m && r[end].seek == seek)
+                end++;
+
+            lseek(fd, seek, SEEK_SET);
+            switch (read_tagfile_entry_and_tag(fd, &tfe, build_idx_buf,
+                                               build_idx_bufsz))
+            {
+                case e_SUCCESS:
+                case e_SUCCESS_LEN_ZERO:
+                    break;
+                default:
+                    logf("delete_entries_batch(): read error tag %d", tag);
+                    goto fail;
+            }
+
+            int32_t crc = crc_32(build_idx_buf, strlen(build_idx_buf),
+                                 0xffffffff);
+            bool in_use = (items[r[j].item].in_use & BIT_N(tag)) != 0;
+
+            for (long g = j; g < end; g++)
+                items[r[g].item].idx.tag_seek[tag] = crc;
+
+            if (!in_use)
+            {
+                /* Write first data byte in tag as \0 */
+                lseek(fd, seek + sizeof(struct tagfile_entry), SEEK_SET);
+                write(fd, "", 1);
+            }
+
+            j = end;
+            do_timed_yield();
+        }
+
+        close(fd);
+        fd = -1;
+    }
+
+    /* 5. Write the entries back with the CRCs in place of the seeks. */
+    for (j = 0; j < m; j++)
+    {
+        lseek(masterfd, sizeof(struct master_header) +
+              (off_t)items[j].idx_id * sizeof(struct index_entry), SEEK_SET);
+        if (write_index_entries(masterfd, &items[j].idx, 1)
+                != sizeof(struct index_entry))
+            goto fail;
+    }
+
+    close(masterfd);
+    return true;
+
+fail:
+    if (fd >= 0)
+        close(fd);
+    close(masterfd);
+    return false;
+}
+
+static bool delete_entries_batch(const int32_t *ids, long count,
+                                 void *work, size_t worksize)
+{
+    int string_tags[TAG_COUNT];
+    int nstr = 0;
+    bool ok = true;
+
+    for (int tag = 0; tag < TAG_COUNT; tag++)
+    {
+        if (!TAGCACHE_IS_NUMERIC(tag))
+            string_tags[nstr++] = tag;
+    }
+
+    size_t per_item = sizeof(struct del_item) +
+                      nstr * sizeof(struct del_seekref);
+    long cap = worksize / per_item;
+
+#ifdef HAVE_TC_RAMCACHE
+    if (tc_stat.ramcache)
+        cap = 0; /* RAM copy must be kept in sync: use delete_entry() */
+#endif
+
+    if (cap < 1)
+    {
+        for (long i = 0; i < count; i++)
+            ok = delete_entry(ids[i]) && ok;
+        return ok;
+    }
+
+    for (long done = 0; done < count; )
+    {
+        long k = MIN(cap, count - done);
+        struct del_item *items = work;
+        struct del_seekref *refs = (struct del_seekref *)&items[k];
+
+        if (!delete_batch_chunk(&ids[done], k, items, refs,
+                                string_tags, nstr))
+        {
+            logf("delete_entries_batch(): chunk failed");
+            ok = false;
+        }
+
+        done += k;
+    }
+
+    return ok;
+}
+#endif /* TAGCACHE_UPDATE_LOOKUP */
+
 /**
  * Returns true if there is an event waiting in the queue
  * that requires the current operation to be aborted.
@@ -4972,6 +5288,36 @@ static bool check_deleted_file_refs(bool auto_update)
         return false;
     }
 
+#ifdef TAGCACHE_UPDATE_LOOKUP
+    /* Collect the missing entries and delete them together at the end
+     * (one pass over the master index per group instead of per entry).
+     * Only with free memory to spare; otherwise delete one by one. */
+    int batch_handle = 0;
+    int32_t *batch_ids = NULL;
+    long batch_count = 0, batch_max = 0;
+    const size_t batch_worksize = 256*1024;
+    bool batch_ok = true;
+#ifdef HAVE_TC_RAMCACHE
+    batch_ok = !tc_stat.ramcache;
+#endif
+    if (batch_ok && current_tcmh.tch.entry_count > 0)
+    {
+        long n = current_tcmh.tch.entry_count;
+        size_t size = n * sizeof(int32_t) + batch_worksize;
+        if (core_allocatable() >= size + 64*1024)
+        {
+            batch_handle = core_alloc_ex(size, &buflib_ops_locked);
+            if (batch_handle > 0)
+            {
+                batch_ids = core_get_data(batch_handle);
+                batch_max = n;
+            }
+            else
+                batch_handle = 0;
+        }
+    }
+#endif
+
     processed_dir_count = 0;
 
     while (!check_event_queue())
@@ -5047,6 +5393,11 @@ static bool check_deleted_file_refs(bool auto_update)
         {
             logf("Entry no longer valid.");
             logf("-> %s / %" PRId32, buf, tfe.tag_length);
+#ifdef TAGCACHE_UPDATE_LOOKUP
+            if (batch_ids && batch_count < batch_max)
+                batch_ids[batch_count++] = idx_id;
+            else
+#endif
             delete_entry(idx_id);
         }
 
@@ -5060,6 +5411,18 @@ wend_finished:
         tcrc_buffer_unlock();
 #endif
     close(fd);
+
+#ifdef TAGCACHE_UPDATE_LOOKUP
+    if (batch_count > 0)
+    {
+        logf("deleting %ld missing entries", batch_count);
+        delete_entries_batch(batch_ids, batch_count,
+                             &batch_ids[batch_max], batch_worksize);
+    }
+    if (batch_handle > 0)
+        core_free(batch_handle);
+#endif
+
     logf("done");
 
     return ret;
