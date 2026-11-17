@@ -137,7 +137,7 @@ static void hp_detect_init_hw1_to_hw3(void)
         hp_detect_reg_old = hp_detect_reg;
     }
 
-    /* Poll the register every second */
+    /* Poll the register every HPD_POLL_TIME (1/4 second) */
     timeout_register(&tmo, &hp_detect_tmo_cb, HPD_POLL_TIME, (intptr_t)&desc);
 }
 
