@@ -643,12 +643,21 @@ int button_apply_acceleration(const unsigned int data)
 
         /* Calculate real numbers item to scroll based upon acceleration
          * setting, use correct roundoff */
-#if   (WHEEL_ACCELERATION == 1)
+#if   (WHEEL_ACCELERATION == 0)
+        /* linear: N times WHEEL_ACCEL_START moves N items per detent */
+        v = v >> 4;
+#elif (WHEEL_ACCELERATION == 1)
         v = (v*v     + (1<< 7))>> 8;
 #elif (WHEEL_ACCELERATION == 2)
         v = (v*v*v   + (1<<11))>>12;
 #elif (WHEEL_ACCELERATION == 3)
         v = (v*v*v*v + (1<<15))>>16;
+#endif
+
+#ifdef WHEEL_ACCEL_MAX_FACTOR
+        /* optional cap on items per detent */
+        if (v > WHEEL_ACCEL_MAX_FACTOR)
+            v = WHEEL_ACCEL_MAX_FACTOR;
 #endif
 
         if (v > 1)

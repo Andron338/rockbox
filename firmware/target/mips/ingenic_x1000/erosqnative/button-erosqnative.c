@@ -330,9 +330,15 @@ static unsigned long wheel_post_data(int btn, int detents)
     if (v > 0xfffffful)
         v = 0xfffffful;
 
-    /* smooth out jitter between detents so a single quick flick
-     * doesn't make the list jump */
-    velocity = velocity ? (3 * velocity + v) / 4 : v;
+    /* Build up speed gradually (a quick flick or a few fast detents don't
+     * make the list jump) but drop it quickly when the wheel slows, so
+     * stopping on an item stays precise. */
+    if (!velocity)
+        velocity = v / 4;
+    else if (v > velocity)
+        velocity += (v - velocity + 7) / 8; /* round up so it reaches v */
+    else
+        velocity = (velocity + v) / 2;
 
     return (1ul << 31) | ((unsigned long)detents << 24) | velocity;
 }

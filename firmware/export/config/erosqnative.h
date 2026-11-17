@@ -99,12 +99,16 @@
 #define CONFIG_KEYPAD   EROSQ_PAD
 #define HAVE_SCROLLWHEEL
 /* Accelerated list scrolling, see wheel_post_data() in
- * button-erosqnative.c. Acceleration starts at WHEEL_ACCEL_START
- * degrees/second (about 10 detents/second) and grows with the square of
- * the speed above that (WHEEL_ACCELERATION 1). */
+ * button-erosqnative.c. Linear (WHEEL_ACCELERATION 0): turning N times
+ * faster than WHEEL_ACCEL_START degrees/second (about 10 detents/second)
+ * moves N items per detent, capped at WHEEL_ACCEL_MAX_FACTOR. */
 #define HAVE_WHEEL_ACCELERATION
 #define WHEEL_ACCEL_START   150
-#define WHEEL_ACCELERATION  1
+#define WHEEL_ACCELERATION  0
+#define WHEEL_ACCEL_MAX_FACTOR  8
+/* Only accelerate in lists with at least this many items (song lists,
+ * big artist/album lists); menus and settings move one item per detent. */
+#define WHEEL_ACCEL_MIN_LIST_ITEMS  50
 #define HAVE_HEADPHONE_DETECTION
 #define HAVE_LINEOUT_DETECTION
 

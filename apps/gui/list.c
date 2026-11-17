@@ -609,7 +609,14 @@ bool gui_synclist_do_button(struct gui_synclist * lists, int *actionptr)
     static bool pgleft_allow_cancel = false;
 
 #ifdef HAVE_WHEEL_ACCELERATION
-    int next_item_modifier = button_apply_acceleration(get_action_data());
+    unsigned int wheel_data = get_action_data();
+#if defined(WHEEL_ACCEL_MIN_LIST_ITEMS) && (WHEEL_ACCEL_MIN_LIST_ITEMS > 0)
+    /* Short lists (menus, settings) are easier to use without acceleration:
+     * keep the detent count but drop the "use acceleration" bit. */
+    if (lists->nb_items < WHEEL_ACCEL_MIN_LIST_ITEMS)
+        wheel_data &= ~(1u << 31);
+#endif
+    int next_item_modifier = button_apply_acceleration(wheel_data);
     /* Only wheel events carry a step count; other buttons (e.g. the
      * Prev/Next keys on players that have both) post 0, so move by one. */
     if (next_item_modifier < 1)
