@@ -283,6 +283,68 @@ void GPIOB23(void)
     gpio_flip_edge_irq(GPIO_BTN_SCROLL_B);
 }
 
+#if defined(HAVE_WHEEL_ACCELERATION) && !defined(BOOTLOADER)
+/* Wheel acceleration.
+ *
+ * Each scroll event carries data in the format button_apply_acceleration()
+ * expects (see firmware/drivers/button.c):
+ *    [31] use acceleration
+ * [30:24] number of detents this event stands for (1-127)
+ *  [23:0] smoothed wheel velocity in degrees/second
+ *
+ * Velocity is measured from the time between scroll events using the OST
+ * timer. A direction change or a pause resets it, so slow, careful
+ * scrolling always moves exactly one item per detent. */
+
+/* Detents per full turn of the wheel. Only used to express the velocity in
+ * degrees/second, so it just scales WHEEL_ACCEL_START. */
+#define WHEEL_DETENTS_PER_REV   24
+/* Gap after which the wheel counts as having stopped */
+#define WHEEL_IDLE_US           250000u
+
+static unsigned long wheel_post_data(int btn, int detents)
+{
+    static int last_btn = BUTTON_NONE;
+    static uint32_t last_us = 0;
+    static unsigned long velocity = 0;
+
+    uint32_t now_us = __ost_read32() / OST_TICKS_PER_US;
+    uint32_t dt = now_us - last_us;
+    last_us = now_us;
+
+    if (detents < 1)
+        detents = 1;
+    if (detents > 0x7f)
+        detents = 0x7f;
+
+    if (btn != last_btn || dt >= WHEEL_IDLE_US || dt == 0)
+    {
+        /* new movement: no acceleration until we have a speed reading */
+        last_btn = btn;
+        velocity = 0;
+        return (unsigned long)detents << 24;
+    }
+
+    /* degrees/second = detents * 360 / (rev detents) / (dt seconds) */
+    unsigned long v = (unsigned long)detents * (360u * 1000000u / WHEEL_DETENTS_PER_REV) / dt;
+    if (v > 0xfffffful)
+        v = 0xfffffful;
+
+    /* smooth out jitter between detents so a single quick flick
+     * doesn't make the list jump */
+    velocity = velocity ? (3 * velocity + v) / 4 : v;
+
+    return (1ul << 31) | ((unsigned long)detents << 24) | velocity;
+}
+#else
+static inline unsigned long wheel_post_data(int btn, int detents)
+{
+    (void)btn;
+    (void)detents;
+    return 0;
+}
+#endif
+
 int button_read_device(void)
 {
     int r = 0;
@@ -337,21 +399,25 @@ int button_read_device(void)
 #endif
 
     /* check encoder - from testing, each indent is 2 state changes or so */
-    if (enc_position > 1)
+    int irq = disable_irq_save();
+    int pos = enc_position;
+    if (pos > 1 || pos < -1)
+        enc_position = 0;
+    restore_irq(irq);
+
+    if (pos > 1)
     {
         /* need to use queue_post() in order to do BUTTON_SCROLL_*,
          * Rockbox treats these buttons differently. */
-        button_queue_post(BUTTON_SCROLL_FWD, 0);
-        enc_position = 0;
+        button_queue_post(BUTTON_SCROLL_FWD, wheel_post_data(BUTTON_SCROLL_FWD, pos / 2));
         reset_poweroff_timer();
         backlight_on();
     }
-    else if (enc_position < -1)
+    else if (pos < -1)
     {
         /* need to use queue_post() in order to do BUTTON_SCROLL_*,
          * Rockbox treats these buttons differently. */
-        button_queue_post(BUTTON_SCROLL_BACK, 0);
-        enc_position = 0;
+        button_queue_post(BUTTON_SCROLL_BACK, wheel_post_data(BUTTON_SCROLL_BACK, -pos / 2));
         reset_poweroff_timer();
         backlight_on();
     }

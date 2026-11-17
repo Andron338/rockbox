@@ -98,6 +98,13 @@
 /* Button defines */
 #define CONFIG_KEYPAD   EROSQ_PAD
 #define HAVE_SCROLLWHEEL
+/* Accelerated list scrolling, see wheel_post_data() in
+ * button-erosqnative.c. Acceleration starts at WHEEL_ACCEL_START
+ * degrees/second (about 10 detents/second) and grows with the square of
+ * the speed above that (WHEEL_ACCELERATION 1). */
+#define HAVE_WHEEL_ACCELERATION
+#define WHEEL_ACCEL_START   150
+#define WHEEL_ACCELERATION  1
 #define HAVE_HEADPHONE_DETECTION
 #define HAVE_LINEOUT_DETECTION
 

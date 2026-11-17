@@ -610,6 +610,10 @@ bool gui_synclist_do_button(struct gui_synclist * lists, int *actionptr)
 
 #ifdef HAVE_WHEEL_ACCELERATION
     int next_item_modifier = button_apply_acceleration(get_action_data());
+    /* Only wheel events carry a step count; other buttons (e.g. the
+     * Prev/Next keys on players that have both) post 0, so move by one. */
+    if (next_item_modifier < 1)
+        next_item_modifier = 1;
 #else
     static int next_item_modifier = 1;
     static int last_accel_tick = 0;
