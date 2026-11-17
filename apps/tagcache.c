@@ -476,6 +476,16 @@ static ssize_t read_tagfile_entry(int fd, struct tagfile_entry *buf)
     if (ret == sizeof(*buf) && tc_stat.econ)
         swap_tagfile_entry(buf);
 
+    /* A negative length can only come from a corrupt file. Callers use it
+     * to seek to the next entry, so it would make them loop forever (or
+     * read with a huge size); report it as a short read instead, which
+     * every caller already treats as an error / end of data. */
+    if (ret == sizeof(*buf) && buf->tag_length < 0)
+    {
+        logf("corrupt tagfile entry: tag_length=%ld", (long)buf->tag_length);
+        return -1;
+    }
+
     return ret;
 }
 
@@ -4765,6 +4775,13 @@ static bool check_deleted_file_refs(bool auto_update)
         }
 
         int idx_id = tfe.idx_id; /* dircache reference clobbers *tfe */
+        if (idx_id < 0 || idx_id >= current_tcmh.tch.entry_count)
+        {
+            /* corrupt entry: don't index out of bounds or delete a
+             * random entry because of it */
+            logf("corrupt tagfile entry: idx_id=%d", idx_id);
+            continue;
+        }
 #ifdef HAVE_DIRCACHE
         struct index_entry *idx = &tcramcache.hdr->indices[idx_id];
         unsigned int searchflag;
