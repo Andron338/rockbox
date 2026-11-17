@@ -4728,12 +4728,19 @@ static bool check_deleted_file_refs(bool auto_update)
     logf("reverse scan...");
 
 #ifdef HAVE_DIRCACHE
-    if (tcramcache.handle > 0)
+    /* With the database loaded in RAM we can use dircache references.
+     * Without it (database not loaded to RAM) fall back to checking the
+     * storage directly, as targets without dircache do; previously this
+     * returned early, so updates never removed deleted files. */
+    bool use_ram = tcramcache.handle > 0;
+    if (use_ram)
+    {
         tcrc_buffer_lock();
-    else
+        /* Wait for any in-progress dircache build to complete */
+        dircache_wait();
+    }
+    else if (!auto_update)
         return false;
-    /* Wait for any in-progress dircache build to complete */
-    dircache_wait();
 #else
     if (!auto_update)
         return false;
@@ -4744,6 +4751,10 @@ static bool check_deleted_file_refs(bool auto_update)
     if (fd < 0)
     {
         logf(TAGCACHE_FILE_INDEX " open fail", tag_filename);
+#ifdef HAVE_DIRCACHE
+        if (use_ram)
+            tcrc_buffer_unlock();
+#endif
         return false;
     }
 
@@ -4782,35 +4793,43 @@ static bool check_deleted_file_refs(bool auto_update)
             logf("corrupt tagfile entry: idx_id=%d", idx_id);
             continue;
         }
+        bool deleted;
 #ifdef HAVE_DIRCACHE
-        struct index_entry *idx = &tcramcache.hdr->indices[idx_id];
-        unsigned int searchflag;
-        if (!auto_update)
+        if (use_ram)
         {
-            if(idx->flag & FLAG_DIRCACHE) /* already found */
+            struct index_entry *idx = &tcramcache.hdr->indices[idx_id];
+            unsigned int searchflag;
+            if (!auto_update)
             {
-                continue;
+                if(idx->flag & FLAG_DIRCACHE) /* already found */
+                {
+                    continue;
+                }
+                searchflag = DCS_CACHED_PATH; /* attempt to load cache references */
             }
-            searchflag = DCS_CACHED_PATH; /* attempt to load cache references */
-        }
-        else /* If auto updating, check storage too */
-        {
-            searchflag = DCS_STORAGE_PATH;
-        }
+            else /* If auto updating, check storage too */
+            {
+                searchflag = DCS_STORAGE_PATH;
+            }
 
-        int rc_cache = dircache_search(searchflag | DCS_UPDATE_FILEREF,
-                                   &tcrc_dcfrefs[idx_id], buf);
+            int rc_cache = dircache_search(searchflag | DCS_UPDATE_FILEREF,
+                                       &tcrc_dcfrefs[idx_id], buf);
 
-        if (rc_cache > 0)           /* in cache and we have fileref */
-        {
-            idx->flag |= FLAG_DIRCACHE;
+            deleted = false;
+            if (rc_cache > 0)           /* in cache and we have fileref */
+            {
+                idx->flag |= FLAG_DIRCACHE;
+            }
+            else if (rc_cache == 0)     /* not in cache but okay */
+            {;}
+            else if (auto_update && rc_cache == ENOENT)
+                deleted = true;
         }
-        else if (rc_cache == 0)     /* not in cache but okay */
-        {;}
-        else if (auto_update && rc_cache == ENOENT)
-#else
-        if (!file_exists(buf))
+        else
 #endif /* HAVE_DIRCACHE */
+            deleted = !file_exists(buf);
+
+        if (deleted)
         {
             logf("Entry no longer valid.");
             logf("-> %s / %" PRId32, buf, tfe.tag_length);
@@ -4823,7 +4842,7 @@ static bool check_deleted_file_refs(bool auto_update)
 wend_finished:
 
 #ifdef HAVE_DIRCACHE
-    if (tcramcache.handle > 0)
+    if (use_ram)
         tcrc_buffer_unlock();
 #endif
     close(fd);
