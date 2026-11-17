@@ -131,10 +131,14 @@
 #endif
 
 /* Battery */
+/* Selectable in Settings > General Settings > System > Battery so people who fit a
+ * larger replacement battery get a correct runtime estimate. Only the
+ * "time remaining" estimate uses this; the percentage comes from the
+ * voltage tables (HW1-3) or the AXP2101 fuel gauge (HW4). */
 #define BATTERY_CAPACITY_DEFAULT 1300 /* default battery capacity */
-#define BATTERY_CAPACITY_MIN 1300  /* min. capacity selectable */
-#define BATTERY_CAPACITY_MAX 1300 /* max. capacity selectable */
-#define BATTERY_CAPACITY_INC 0   /* capacity increment */
+#define BATTERY_CAPACITY_MIN 1000  /* min. capacity selectable */
+#define BATTERY_CAPACITY_MAX 3500 /* max. capacity selectable */
+#define BATTERY_CAPACITY_INC 50   /* capacity increment */
 
 #define CURRENT_NORMAL 100      // 1.7mA * 60s
 #define CURRENT_BACKLIGHT 180
