@@ -2270,6 +2270,203 @@ static void db_log(const char *prefix, const char *msg)
 }
 #endif
 
+#if !defined(__PCTOOL__) && !defined(APPLICATION)
+/* Update lookup table.
+ *
+ * During a database update every file found on disk has to be looked up in
+ * the existing database. Without it, find_entry_disk() walks the filename
+ * tag file (a full pass, twice, for every file that is not in the database
+ * yet) and get_index() opens the master index for every file that is.
+ *
+ * Instead, read the filename tag file and the master index once at the
+ * start of the update and keep a sorted table of
+ *   (hash of path) -> (index id, mtime)
+ * so each lookup is a binary search in RAM. The table only uses memory that
+ * is already free (never shrinking the audio buffer, which would interrupt
+ * playback); if there isn't enough, the old disk lookups are used. */
+#define TAGCACHE_UPDATE_LOOKUP
+
+struct update_lookup_entry {
+    uint32_t hash1;
+    uint32_t hash2;
+    int32_t  idx_id;
+    int32_t  mtime;     /* tag_seek[tag_mtime] of the index entry */
+};
+
+static int update_lookup_handle = 0;
+static struct update_lookup_entry *update_lookup = NULL;
+static long update_lookup_count = 0;
+
+/* Two different 32-bit string hashes (FNV-1a and djb2-xor), giving a 64-bit
+ * key; a false match between two different paths is vanishingly unlikely. */
+static void update_lookup_hash(const char *s, uint32_t *h1, uint32_t *h2)
+{
+    uint32_t a = 2166136261u, b = 5381;
+    for (; *s; s++)
+    {
+        unsigned char c = *s;
+        a = (a ^ c) * 16777619u;
+        b = (b * 33) ^ c;
+    }
+    *h1 = a;
+    *h2 = b;
+}
+
+static int update_lookup_cmp(const void *p1, const void *p2)
+{
+    const struct update_lookup_entry *e1 = p1, *e2 = p2;
+    if (e1->hash1 != e2->hash1)
+        return e1->hash1 < e2->hash1 ? -1 : 1;
+    if (e1->hash2 != e2->hash2)
+        return e1->hash2 < e2->hash2 ? -1 : 1;
+    return 0;
+}
+
+static void update_lookup_free(void)
+{
+    if (update_lookup_handle > 0)
+        core_free(update_lookup_handle);
+    update_lookup_handle = 0;
+    update_lookup = NULL;
+    update_lookup_count = 0;
+}
+
+static void update_lookup_build(void)
+{
+    struct master_header tcmh;
+    struct tagcache_header tch;
+    struct index_entry idx;
+    struct tagfile_entry tfe;
+    char buf[TAGCACHE_BUFSZ];
+    long n, i;
+    int fd;
+
+    update_lookup_free();
+
+    if (!tc_stat.ready)
+        return;
+
+    fd = open_master_fd(&tcmh, false);
+    if (fd < 0)
+        return;
+
+    n = tcmh.tch.entry_count;
+    size_t size = n * sizeof(struct update_lookup_entry);
+
+    /* Leave some headroom so nothing else gets squeezed either. */
+    if (n <= 0 || core_allocatable() < size + 64*1024)
+    {
+        logf("update lookup: not enough free memory (%ld entries)", n);
+        close(fd);
+        return;
+    }
+
+    /* Locked: we keep the pointer while yielding. */
+    update_lookup_handle = core_alloc_ex(size, &buflib_ops_locked);
+    if (update_lookup_handle <= 0)
+    {
+        update_lookup_handle = 0;
+        close(fd);
+        return;
+    }
+    update_lookup = core_get_data(update_lookup_handle);
+
+    /* Pass 1: mtime of every index entry. idx_id is a state until pass 2:
+     * -1 = deleted, -2 = waiting for its filename. Entries still negative
+     * after pass 2 are dropped. */
+    for (i = 0; i < n; i++)
+    {
+        if (read_index_entries(fd, &idx, 1) != sizeof(struct index_entry))
+            goto fail;
+
+        update_lookup[i].idx_id = (idx.flag & FLAG_DELETED) ? -1 : -2;
+        update_lookup[i].mtime = idx.tag_seek[tag_mtime];
+        update_lookup[i].hash1 = 0;
+        update_lookup[i].hash2 = 0;
+        do_timed_yield();
+    }
+    close(fd);
+
+    /* Pass 2: hash every filename and attach it to its index entry.
+     * Deleted filenames have their first byte cleared (see delete_entry)
+     * and come back as e_SUCCESS_LEN_ZERO, so they are skipped. */
+    fd = open_tag_fd(&tch, tag_filename, false);
+    if (fd < 0)
+        goto fail;
+
+    while (true)
+    {
+        int res = read_tagfile_entry_and_tag(fd, &tfe, buf, sizeof(buf));
+        if (res == e_ENTRY_SIZEMISMATCH)
+            break; /* end of file */
+        if (res != e_SUCCESS && res != e_SUCCESS_LEN_ZERO)
+            goto fail; /* corrupt: fall back to the disk lookups */
+        if (res == e_SUCCESS_LEN_ZERO)
+            continue;
+
+        if (tfe.idx_id < 0 || tfe.idx_id >= n)
+            goto fail;
+
+        struct update_lookup_entry *e = &update_lookup[tfe.idx_id];
+        if (e->idx_id == -2)
+        {
+            update_lookup_hash(buf, &e->hash1, &e->hash2);
+            e->idx_id = tfe.idx_id;
+        }
+        do_timed_yield();
+    }
+    close(fd);
+    fd = -1;
+
+    /* Drop deleted entries and entries without a filename, then sort. */
+    long count = 0;
+    for (i = 0; i < n; i++)
+    {
+        if (update_lookup[i].idx_id < 0)
+            continue;
+        update_lookup[count++] = update_lookup[i];
+    }
+    update_lookup_count = count;
+    qsort(update_lookup, count, sizeof(struct update_lookup_entry),
+          update_lookup_cmp);
+
+    logf("update lookup: %ld entries", count);
+    return;
+
+fail:
+    logf("update lookup: build failed, using disk lookups");
+    if (fd >= 0)
+        close(fd);
+    update_lookup_free();
+}
+
+/* Returns the index id of path, or -1 if it isn't in the database.
+ * Must only be called while update_lookup is valid. */
+static long update_lookup_find(const char *path, int32_t *mtime)
+{
+    struct update_lookup_entry key;
+    update_lookup_hash(path, &key.hash1, &key.hash2);
+
+    long lo = 0, hi = update_lookup_count - 1;
+    while (lo <= hi)
+    {
+        long mid = lo + (hi - lo) / 2;
+        int cmp = update_lookup_cmp(&key, &update_lookup[mid]);
+        if (cmp == 0)
+        {
+            *mtime = update_lookup[mid].mtime;
+            return update_lookup[mid].idx_id;
+        }
+        if (cmp < 0)
+            hi = mid - 1;
+        else
+            lo = mid + 1;
+    }
+
+    return -1;
+}
+#endif /* !__PCTOOL__ && !APPLICATION */
+
 /* GCC 3.4.6 for Coldfire can choose to inline this function. Not a good
  * idea, as it uses lots of stack and is called from a recursive function
  * (check_dir).
@@ -2316,6 +2513,18 @@ static void NO_INLINE add_tagcache(char *path, unsigned long mtime)
     idx_id = find_entry_ram(path);
 #endif
 
+    bool from_lookup = false;
+    int32_t lookup_mtime = 0;
+#ifdef TAGCACHE_UPDATE_LOOKUP
+    if (idx_id < 0 && update_lookup)
+    {
+        /* The table holds every live database entry, so a miss here means
+         * the file is new: no need to search the disk. */
+        idx_id = update_lookup_find(path, &lookup_mtime);
+        from_lookup = (idx_id >= 0);
+    }
+    else
+#endif
     /* Be sure the entry doesn't exist. */
     if (filenametag_fd >= 0 && idx_id < 0)
         idx_id = find_entry_disk(path, false);
@@ -2328,7 +2537,12 @@ static void NO_INLINE add_tagcache(char *path, unsigned long mtime)
         /* TODO: Mark that the index exists (for fast reverse scan) */
         //found_idx[idx_id/8] |= idx_id%8;
 
-        if (!get_index(-1, idx_id, &idx, true))
+        if (from_lookup)
+        {
+            /* mtime came from the lookup table, no disk read needed */
+            idx.tag_seek[tag_mtime] = lookup_mtime;
+        }
+        else if (!get_index(-1, idx_id, &idx, true))
         {
             logf("failed to retrieve index entry");
             DB_LOG("error", "failed to retrieve index entry");
@@ -5142,6 +5356,11 @@ void do_tagcache_build(const char *path[])
 
     cpu_boost(true);
 
+#ifdef TAGCACHE_UPDATE_LOOKUP
+    /* Fast lookups of existing entries during the scan (if memory allows) */
+    update_lookup_build();
+#endif
+
     logf("Scanning files...");
     /* Scan for new files. */
     memset(&header, 0, sizeof(struct tagcache_header));
@@ -5233,6 +5452,11 @@ void do_tagcache_build(const char *path[])
     free_search_roots(&roots_ll[0]);
 
 commit:
+#ifdef TAGCACHE_UPDATE_LOOKUP
+    /* Free it before commit(), which wants all free memory for sorting */
+    update_lookup_free();
+#endif
+
     /* Write the header. */
     header.magic = TAGCACHE_MAGIC;
     header.datasize = data_size;
