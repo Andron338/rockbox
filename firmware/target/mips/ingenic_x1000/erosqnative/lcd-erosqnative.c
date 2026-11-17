@@ -350,6 +350,18 @@ static const uint32_t erosqnative_lcd_cmd_enable_ili9342c[] = {
     LCD_INSTR_END,
 };
 
+#ifndef BOOTLOADER
+/* Turn on the panel's Tearing Effect output (V-blank only), so the LCD
+ * controller can start each DMA frame during V-blank (te_enable below).
+ * Neither enable sequence above does this in the main firmware, and with
+ * te_enable set but no TE signal the display would stop updating. */
+static const uint32_t erosqnative_lcd_cmd_te_on[] = {
+    LCD_INSTR_CMD,      0x35, // Tearing Effect Line ON
+    LCD_INSTR_DAT,      0x00, // V-blank only
+    LCD_INSTR_END,
+};
+#endif
+
 static const uint32_t erosqnative_lcd_of_compat_cmd[] = {
     /* Pixel Format Set */
     LCD_INSTR_CMD,      0x3a,
@@ -402,7 +414,11 @@ const struct lcd_tgt_config lcd_tgt_config = {
     .clk_polarity = 0,
     .dc_polarity = 0,
     .wr_polarity = 1,
-    .te_enable = 0, /* OF had TE enabled (1) */
+#ifdef BOOTLOADER
+    .te_enable = 0,
+#else
+    .te_enable = 1, /* OF had TE enabled too; see erosqnative_lcd_cmd_te_on */
+#endif
     .te_polarity = 1,
     .te_narrow = 0,
     .dma_wr_cmd_buf = &erosqnative_lcd_dma_wr_cmd,
@@ -482,6 +498,10 @@ void lcd_tgt_enable(bool enable)
             lcd_exec_commands(&erosqnative_lcd_cmd_enable_gc9308[0]);
             break;
         }
+
+#ifndef BOOTLOADER
+        lcd_exec_commands(&erosqnative_lcd_cmd_te_on[0]);
+#endif
     } else {
         /* doesn't flash white if we don't do anything... */
 #if 0
