@@ -27,6 +27,21 @@
 #define CPU_FREQ           1008000000
 #define HAVE_FPU
 
+/* CPU frequency scaling.
+ *
+ * The CPU runs from SCLK_A (APLL, 1008 MHz) and set_cpu_frequency() in
+ * system-x1000.c only changes the CPU/L2 divider; AHB0/AHB2/PCLK, the OST
+ * timer and the delay functions are clocked independently, so they are not
+ * affected. The AHB0 bus runs at 1008/5 = 201.6 MHz (see clk-x1000.c), so
+ * we don't go below that: the normal clock is 1008/5 = 201.6 MHz and we
+ * boost to the full 1008 MHz for buffering, database work, plugins, etc.
+ *
+ * Bootloader and simulator builds undefine HAVE_ADJUSTABLE_CPU_FREQ. */
+#define HAVE_ADJUSTABLE_CPU_FREQ
+#define CPUFREQ_MAX        CPU_FREQ          /* 1008 MHz, divider 1 */
+#define CPUFREQ_NORMAL     (CPU_FREQ / 5)    /* 201.6 MHz, divider 5 */
+#define CPUFREQ_DEFAULT    CPUFREQ_NORMAL
+
 #ifndef SIMULATOR
 #define TIMER_FREQ         X1000_EXCLK_FREQ
 #endif
