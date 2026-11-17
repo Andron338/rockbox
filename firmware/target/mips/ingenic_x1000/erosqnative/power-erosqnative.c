@@ -29,6 +29,9 @@
 #include "i2c-ingenic.h"
 #include "power-erosqnative.h"
 #include "gpio-ingenic.h"
+#ifndef BOOTLOADER
+# include "backlight.h"
+#endif
 
 int eros_qn_pmu_type = -1;
 
@@ -279,6 +282,22 @@ int _battery_voltage(void)
 }
 
 #if CONFIG_BATTERY_MEASURE & CURRENT_MEASURE
+static int erosqn_estimate_current(void)
+{
+    int current = CURRENT_NORMAL;
+
+#ifndef BOOTLOADER
+    if (backlight_get_current_timeout() == 0) /* backlight always on */
+        current += CURRENT_BACKLIGHT;
+#endif
+
+    /* While charging, report the charging current */
+    if (charging_state())
+        current = MAX(CURRENT_MAX_CHG - current, 1);
+
+    return current;
+}
+
 int _battery_current(void)
 {
     switch (eros_qn_pmu_type)
@@ -290,11 +309,11 @@ int _battery_current(void)
             return axp192_adc_read(AXP192_ADC_DISCHARGE_CURRENT);
 
     case EROS_QN_PMU_AXP2101:
-        /* not supported here */
-        return -1;
-
     default:
-        return -1;
+        /* The AXP2101 (HW4) has no battery current ADC. Fall back to the
+         * same estimate powermgmt.c uses on targets without CURRENT_MEASURE,
+         * so the runtime estimate keeps working on these units. */
+        return erosqn_estimate_current();
     }
 }
 #endif

@@ -120,7 +120,10 @@
 #define SDMMC_HOST_NUM_SD_CONTROLLERS 1
 
 /* Power management */
-#define CONFIG_BATTERY_MEASURE (VOLTAGE_MEASURE | PERCENTAGE_MEASURE/*|CURRENT_MEASURE*/)
+/* CURRENT_MEASURE: HW1-3 (AXP192) read real charge/discharge current from
+ * the PMU; HW4 (AXP2101) has no current ADC and falls back to an estimate
+ * based on CURRENT_NORMAL/CURRENT_BACKLIGHT (see power-erosqnative.c). */
+#define CONFIG_BATTERY_MEASURE (VOLTAGE_MEASURE | PERCENTAGE_MEASURE | CURRENT_MEASURE)
 #define CONFIG_CHARGING        CHARGING_MONITOR
 #define HAVE_SW_POWEROFF
 
